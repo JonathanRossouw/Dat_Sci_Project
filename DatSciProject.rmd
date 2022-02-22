@@ -1,0 +1,643 @@
+---
+author: "Jonathan Rossouw"
+output:
+  bookdown::pdf_document2:
+    toc: false
+title: "Predicting New COVID-19 Cases in South Africa using Long Short Term Memory Recurrent Neural Networks"
+bibliography: ref/ref.bib
+csl: ref/harvard-stellenbosch-university.csl
+---
+
+```{r loading packages, message=FALSE, warning=FALSE, include=FALSE}
+################################################################################
+##                               RMarkdown Code                               ##
+################################################################################
+
+####### Setup
+# Set knitr options
+knitr::opts_chunk$set(echo = FALSE,
+                      warning = FALSE, 
+                      fig.width = 5,
+                      fig.height = 4,
+                      fig.align = 'center')
+rm(list = ls()) # Clean your environment:
+gc() # garbage collection
+# Loadpackages
+library(pacman)
+p_load(knitr, lubridate, caret, reticulate, bigrquery, DBI, glue, urca, tseries,
+       forecast, TSA, timetk, cowplot, rsample, zoo, tidyverse, xtable, kableExtra)
+# Set Python virtual environment for Tensorflow and Keras
+reticulate::use_virtualenv(".venv/", require = TRUE)
+reticulate::py_config()
+# Install Tensorflow and Keras in virtual environment
+### virtualenv_install(".venv/", "tensorflow")
+### install_tensorflow()
+### install_keras()
+# Load Tensorflow and Keras
+library(tensorflow)
+library(keras)
+# Source in all your functions:
+list.files('code/', full.names = T, recursive = T) %>%
+  as.list() %>% 
+  walk(~source(.))
+# Set cache to TRUE to load cache Hyperparameter tuning results
+cache = TRUE
+
+```
+
+# Introduction {#Introduction}
+
+For over a year, the world as we knew it has been utterly upended by COVID-19. Millions of people around the world have gotten ill and millions have died. The whole world was brought to a standstill by the virus. South Africa in particular has been hard hit. Unemployment is at record highs while our hospitals are overflowing. Fortunately, scientists from around the world have worked together to develop vaccines that offer hope for an end to the pandemic. However, due to a lack of supply and poor planning, South Africa is not one of those countries that are able to quickly vaccinate their populations. Thus one of the only ways to fight the virus is to accurately predict the number of infections in the future and plan accordingly.
+\par
+
+The number of COVID-19 infections, hereafter referred to as cases, is a time-series of data that can be modelled using machine learning techniques. In this paper, data from Google BigQuery's public datasets was used to model cases and then the models were used to predict 14 days of cases. Two classes of models were used. The first was a simple ARIMA model, used as a benchmark, and the second was a long short-term memory (LSTM) recurrent neural network (RNN). LSTM models have been used to model COVID-19 cases in @LSTM and @LSTM2 with high degrees of accuracy. LSTM models overcome issues faced by RNN models which allow the models to perform well on long sequences of data. LSTM models incorporate  forget gates in each memory cell that allow hidden units to incorporate both new inputs and weighted combinations of past inputs. This effectively changes the weights of hidden units depending on the state of the inputs. Thus models are able to determine, from previous occurrences of similar states, the most appropriate weights for the current inputs based on the state of the inputs. This is particularly important for COVID-19 cases data as cases rise and fall in waves. The LSTM models are able to determine whether the inputs for part of a wave or a lull and change the weights in the hidden layers appropriately [@LSTM]. Univariate and multivariate LSTM models were created and used to predict 14 days worth of cases. Model performances is based on the lowest test mean squared error (MSE). MSE was chosen as it is a standard measure of performance and it penalises predictions that are not able to identify sharp up-ticks in cases.
+\par
+The remainder of the paper consists of a discussion of the data, the methodology of each of the models used, the results of the models and a conclusion. 
+
+# Data {#Data}
+
+Data was sourced from Google Big Query public databases [@data]. More specifically the covid_open_data was sourced using the following SQL query:
+
+```{sql, eval=FALSE, echo=TRUE}
+SELECT country_name, new_confirmed, date, location_key, cumulative_tested,
+new_persons_vaccinated, new_deceased
+FROM `bigquery-public-data.covid19_open_data.covid19_open_data` 
+WHERE country_name IN ('South Africa') AND location_key IN ('ZA')
+ORDER BY date
+
+```
+
+```{r big query data loading, include=FALSE}
+##### Google BigQuery Data loading
+# Set billing ID
+# billing_id <- ######
+# Create Connection to Database
+bq_con =
+  dbConnect(
+    bigrquery::bigquery(),
+    project = "bigquery-public-data",
+    dataset = "covid19_open_data",
+    billing = billing_id
+  )
+# Set BigQuery Authentication
+#bq_auth(email = "####")
+# Call Appropriate Dataset
+cov <- tbl(bq_con, "covid19_open_data")
+# Create SQL Query to call data
+sql_query <- glue_sql("SELECT country_name, new_confirmed, date, location_key,
+cumulative_tested, new_persons_vaccinated, new_deceased
+FROM `bigquery-public-data.covid19_open_data.covid19_open_data` 
+WHERE country_name IN ('South Africa') AND location_key IN ('ZA')
+ORDER BY date",
+.con = bq_con
+)
+# Create Tibble in memory to use for analysis
+data <- dbGetQuery(conn = bq_con, sql_query)
+
+```
+
+```{r data-description}
+###### Data Description
+# Filter Dates
+data <- data %>% 
+  mutate(date = as.Date(date)) %>% 
+  filter(date <= as.Date("2021/06/30"))
+# First Cases
+first_cases <- data %>% 
+  select(date, new_confirmed) %>% 
+  rename(cases = new_confirmed) %>% 
+  filter(cases > 0) %>% head(1)
+# Maximum Cases
+max_cases <- data %>% 
+  select(date, new_confirmed) %>% 
+  rename(cases = new_confirmed) %>% 
+  filter(cases == max(cases, na.rm = TRUE)) %>% head(1)
+# Total Cases
+total_cases <- data %>% 
+  rename(cases = new_confirmed) %>% 
+  summarise(cases = sum(cases, na.rm = TRUE)) %>% head(1)
+# Mean Cases
+mean_cases <- data %>% 
+  rename(cases = new_confirmed) %>% 
+  summarise(cases = mean(cases, na.rm = TRUE)) %>% head(1)
+# Standard Deviation of Cases
+sd_cases <- data %>% 
+  rename(cases = new_confirmed) %>% 
+  summarise(cases = sd(cases, na.rm = TRUE)) %>% head(1)
+# Data Description Data Frame
+descrip_data <- rbind(first_cases %>% 
+                        mutate(date = as.character(date)) %>% 
+                        relocate(cases, date), 
+max_cases %>% mutate(date = as.character(date)) %>% relocate(cases, date), 
+total_cases %>% mutate(date = "-"),  
+mean_cases %>% mutate(date = "-"), 
+sd_cases %>% mutate(date = "-")) %>% 
+  mutate(description = c("First Cases",
+                         "Max Cases", 
+                         "Total Cases", 
+                         "Mean Cases", 
+                         "Standard Deviation of Cases")) %>% 
+  relocate(description, date, cases) %>% 
+  rename(Description = description, Date = date, Cases = cases)
+# Print Data Description
+kable(descrip_data, 
+      caption = "Description of data", 
+      row.names = FALSE, 
+      digits = 0, 
+      format = "latex") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+The new cases, cumulative tests, new vaccinated persons and newly deceased data was sourced. The new cases was used for both the ARIMA and univariate LSTM models and is discussed below where it is refered to as the data. The remaining three time series are used in the multivariate LSTM and are discussed in detail in the section \@ref(Multivariate).
+
+\par
+
+The data consists of 546 observations spanning from 1 January 2020 to 30 June 2021. As seen in table \@ref(tab:data-description), the first cases in South Africa appear on 3 March 2020, the maximum daily cases was 31328 cases on 1 January 2021. The total number of cases by 30 June is 1 995 556 with a mean of 3648 cases and a standard deviation of 4739 cases. From figure \@ref(fig:plot-data) it can be seen that South Africa has experienced three distinct waves of COVID-19. The fact that the data does not grow with a linear or exponential trend is part of the motivation for using a LSTM model. As described in the section \@ref(LSTM), the model has a memory which allows it to identify which state the series is in and change the parameters appropriately. This allows the model to identify whether or not it is currently in a wave or a lull and predict cases accordingly.
+
+\par
+
+The data is split into a training dataset from 13 June 2020 to 22 May 2021, a validation set which includes 19 May 2021 to 1 June 2021 for training and cases from 2 June 2021 to 15 June 2021 are to be predicted, and a test set where cases from 16 June 2021 to 30 June 2021 are to be predicted.
+
+```{r plot-data, fig.cap = "Cases from 1 January 2020 to 30 June 2021"}
+#### Plot Cases
+data %>% 
+  rename(cases = new_confirmed) %>% 
+    ggplot() + 
+   theme_bw() +
+    geom_line(aes(x = date, y = cases), colour = "deepskyblue4", alpha = 0.8) + 
+    labs(title = "SA Covid Cases 1 January 2020 - 30 June 2021", 
+        y = "cases")
+
+```
+
+# Methodology {#Methodology}
+
+The methodology consisted of two distinct sections. The first being the ARIMA modelling where the data were wrangled to fit the requirements of the model, tests for stationarity using the Augmented Dickey Fuller (AFD) tests were carried out, autocorrelation functions (ACFs) and partial autocorrelation functions (PACFs) were plotted and a models were fit. The second section contains an overview of the LSTM models and four subsections. The first subsection described how the data were wrangled and data arrays created for the univariate LSTM models, the second describes how the data were wrangled and data arrays created for the multivariate LSTM, the third describes how the hyperparameter tuning was performed, and the fourth subsection describes how Google Cloud Compute was used for hyperparameter tuning. The performance of all models was determined by the MSE given by 
+
+\begin{equation}\label{eq1}
+\text{MSE} = \sum_{i=1}^N(P_i - A_i)^2 
+\end{equation}
+
+where $N$ is the number of observations predicted, which equals 14 in all cases, $P_i$ is the predicted value for the observation, and $A_i$ is the actual value for the observation.
+
+
+## ARIMA {#Arima}
+
+ARIMA or Autoregressive Integrated Moving Average models are a class of time series models for modelling stationary inputs with stochastic shocks in the form of $$X_t - \phi_1 X_{t-1} - \phi_2 X_{t-2} - ... - \phi_p X_{t-p} = \varepsilon_t - \theta_1 \varepsilon_{t-1} - ... - \theta_q \varepsilon_{t-q},$$ where $\phi_i$ and $\theta_i$ are modelled on the data [@book]. The methodology of estimating the ARIMA order of the follows from @book. In order for the cases time series to be modelled using an ARIMA model, it was first centred by subtracting the mean and dividing by the standard deviation. Once the data is wrangled, the order of integration needs to be determined by performing the ADF test for stationarity. Figure \@ref(fig:ARIMA-plot) shows the ARIMA data in levels, first differences and second differences and table \@ref(tab:adf) shows the results of the ADF tests. From figure \@ref(fig:ARIMA-plot), in levels the ARIMRA data does not appear stationary, while both the first differenced and second differenced ARIMA data plots have portions of larger values that coincide with the first and second waves. From table \@ref(tab:adf) the null hypothesis of non-stationarity cannot be rejected for the ARIMA data in levels while it can be rejected for both the first and second differenced data.
+
+```{r ARIMA-wrangle}
+#### Data Wrangle and Plot ARIMA data
+# Wranlge data
+ data_arima <- data_wrangling_func(data = data %>% rename(cases = new_confirmed),
+                                   type = "arima",
+                                   final_date = "2021/06/16")
+# Set Mean and Standard Deviation of cases
+ cases_mean_sd <- data_arima$cases_mean_sd
+#Set data
+data_arima <- data_arima$data
+
+```
+
+```{r ARIMA-acf-func, include=FALSE}
+##### Perform Stationarity Tests, Plot ACFs and PACFs, 
+# and determine order of ARIMA
+adf_arima <- adf_func(data_arima)
+
+```
+
+```{r ARIMA-plot, fig.cap = "Plot of ARIMA data in levels, first differences and second differences"}
+### Plot ARIMA Data
+adf_arima$`Levels, First and Second Difference Plots`
+
+```
+
+```{r adf}
+#### Table of AFR results
+kable(adf_arima$`Augmented Dickey Fuller Test`, 
+      caption = "ADF test results", 
+      row.names = FALSE, format = "latex", digits = 3) %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+In order to to determine the correct ARIMA order, the ACFs and PACFs of the levels, first and second differenced data were inspected. Figure \@ref(fig:acf-pacf-plot) shows the in levels the data was non-stationary and shows a high level of persistence. The first differenced ACF shows a high level of seasonality every seventh period, additionally, the majority of the points in the ACF and PACF plots are not between the blue dotted lines indicating they values are statistically significantly non-zero. This could indicate non-stationarity. The second differenced ACFs and PACFs show similar results with seasonality but with more ACF values between the dotted lines. Although the plots indicate the data may not be stationary, since this is the benchmark model, modelling will continue. From table \@ref(eacf-diff-1), the x's, which indicate non-significant p-values for ARIMA order, are distributed across the table indicating that the model may be non-stationary. This follows from the ACFs and PACFs and an ARIMA model with order of integration of 1 is a misspecification. From table \@ref(eacf-diff-2), ARIMA(2,2,2), ARIMA(3,2,3) and ARIMA(4,2,4) seem plausible and are compared in section \@ref(Results).
+
+```{r acf-pacf-plot, fig.cap = "Plot of ACFs and PACFs for data in level, first differences and second differences"}
+#### ACFs
+adf_arima$`ACF and PACF Plots`
+
+```
+
+```{r eacf, results='asis'}
+#### EACF for First Differenced ARIMA
+t1 <- kable(adf_arima$`EACF Diff 1`$symbol %>% rbind(0:5, .),
+      format = "latex",
+      col.names = c("AR/MA", "", "", "", "", ""))
+
+#### EACF for Second Differenced ARIMA
+t2 <- kable(adf_arima$`EACF Diff 2`$symbol %>% rbind(0:5, .),
+      format = "latex", 
+      col.names = c("AR/MA", "", "", "", "", ""))
+
+cat(c("\\begin{table}[!htb]
+    \\begin{minipage}{.5\\linewidth}
+      \\caption{First differenced extended ACF}
+      \\label{eacf-diff-1}
+      \\centering",
+        t1,
+    "\\end{minipage}
+    \\begin{minipage}{.5\\linewidth}
+        \\centering
+        \\caption{Second differenced extended ACF}
+        \\label{eacf-diff-2}",
+        t2,
+    "\\end{minipage} 
+\\end{table}"
+)) 
+
+```
+
+## LSTM {#LSTM}
+
+LSTM models are a form of RNN which perform well on predicting time series data. LSTM models overcome the issue of vanishing gradients that occur when RNN models deal with long input sequences. LSTM models overcome the issue by including a forget gate to the usual input and output gates of RNN models. Following @LSTM, each LSTM memory cell consists of a memory cell $c_t$ and working cell $h_t$. Memory cells are controlled by forgetting gates $f_t$ which determines the retention of the sequence. Each memory cell has output as working memory $h_t$, and output gate $o_t$ that controls the portion of $c_t$ to be remembered. The input gate $i_t$ controls the portion of previous working memory $h_{t-1}$  and current input $x_t$ to be remembered in the memory cell. The previous memory cell state $h_{t-1}$ and the current input $x_t$ are fed into the hyperbolic tangent, $tanh$, activation function. Figure \@ref(fig:lstm-diagram) shows the structure of a LSTM memory cell where 
+
+\begin{align*}
+f_t &= \sigma(w_f \times [h_{t-1}, x_t] + b) \\
+i_t &= \sigma(w_i \times [h_{t-1}, x_t] + b_i) \\
+C_t &= tanh(w_c \times [h_{t-1}, x_t] + b_c) \\
+c_t &= f_t \times c_{t-1} + i_t \times c_t \\
+o_t &= \sigma(w_o \times [h_{t-1}, x_t] + b) \\
+h_t &= o_t \times tanh(c_t)
+\end{align*}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=4in]{bin/LSTM_diagram.png}
+    \caption{LSTM memory cell (Yudistira 2020)}
+    \label{fig:lstm-diagram}
+\end{figure}
+
+The neural network architecture follows from @alice, with both the univariate and multivariate LSTM models contain two LSTM hidden layers which each with 50 hidden units and a linear output layer. The hard-sigmoid recurrent activation function is used and a dropout rate of 0.1 is used to avoid overfitting. There are many different featuers and configurations to consider when creating LSTM models. In order to ensure that the best model is chosen for the specific structure of the data, hyperparameter tuning is required. Of the many hyperparameters, the loss function, optimizer and the number of epochs were considered. The loss function determines the performance of the model and thus how the parameters are fit to the data. Here MSE as described in equation \ref{eq1} and mean absolute error (MAE) given by 
+
+\begin{equation} \label{eq2}
+\text{MAE} = \sum_{i=1}^N |P_i - A_i|
+\end{equation}
+
+where N is the number of observations, $P_i$ is the predicted value and $A_i$ is the actual value of the observation were considered. The epochs refers to how many times the model cycles through the data set while training. This is in order to create a better generalization of the data and improve the fit of the model. However, too many epochs can result in overfitting thus hyperparameter tuning is required. The optimizer refers to the method which is used to update the weights in the hidden layers of the model while training. There are many different optimizers that are based on gradient descent. Here the adam optimizer which is a form of stochastic gradient descent that includes first order and second order moments, and the SGD optimizer, which is a version of gradient descent with momentum, are considered.
+
+### Univariate LSTM {#Univariate}
+
+The univariate LSTM is fit on the single cases time series. Before the LSTM model can be fit, the data must be wrangled. Data is rescaled using min-max scaling following 
+$$
+Z_t = \frac{X_t - min(X)}{max(X) - min(X)}
+$$ 
+where the minimum and maximum are determined from the entire time series. Figure \@ref(fig:lstm-data-plot) shows that the rescaled data increases the prominence of the peaks of the waves which are the most important aspect to model. As the aim of the model is to predict a 14 day period, the data is split into training variables and target variables. The training variables are 14 day periods and the target variables are the following 14 day periods. The training variables follow each other thus a target variable will be the next training variable. In total there are 22 training variable and target variable blocks. The training variables consist of data from 13 June 2020 to 8 May 2021 and the target variables consist of data from 28 June 2020 to 22 May 2021. The fitted model is used to predict the 14 day period 2 June 2021 to 15 June 2021 using 19 May 2021 to 1 June 2021 as the predictors. The MSE from the predictions and the validation set are used to determine the performance of the model.
+
+```{r lstm-data-plot, fig.cap = "LSTM data with min-max rescaled cases"}
+### Wrangle and Plot LSTM Data
+# Wrangle data
+  data_lstm <- data_wrangling_func(data = data %>% rename(cases = new_confirmed),
+                                   type = "lstm", 
+                                   final_date = "2021/06/16")
+# Set min and max for later transformations
+  cases_min_max <- data_lstm$cases_min_max
+  data_lstm <- data_lstm$data
+# Plot Rescaled LSTM data 
+ data_lstm %>% 
+    ggplot() + 
+    theme_bw() +
+    geom_line(aes(x = date, y = cases), colour = "deepskyblue4", alpha = 0.8) + 
+    labs(title = "SA Covid Cases 13 June 2020 - 15 June 2021", 
+         subtitle =  "Rescaled (Min Max)",
+         y = "min max scaled cases")
+ 
+```
+
+```{r create-arrays}
+### Create LSTM Data Arrays
+data_train <- data_lstm
+data_array <- data_array_func(data_train, initial = 14, assess = 14, skip = 14)
+
+```
+
+### Multivariate LSTM {#Multivariate}
+
+The multivariate LSTM included, in addition to new cases, new persons vaccinated, the first difference of cumulative tests to create a new tests variable, and new deceased. Figure \@ref(fig:ccf-plots) shows the rescaled time series' of the new variables using min-max rescaling. The figure also shows the cross correlation function (CCF) plots of the new variables and new cases. New tests has its greatest cross correlation at zero which indicates the series are closely linked. Both new persons vaccinated and new deceased have the largest cross correlations at lags less than negative 10.
+
+\par
+
+The training variables were created similarly to the univariate training variable. The new tests data was wrangled by interpolating an NA values from the cumulative tests time series and then taking the first difference of the series. The new vaccinated persons time series was wrangled by replacing NA values with 0 values. The new deceased time series was not wrangled. The wrangled times series followed the same process as applied to the cases time series in the univariate training set to create new 14 day long blocks of predictors. The predictors were then combined into an array with 4 levels with each level containing 22 blocks of training variables and 22 blocks of target variables.
+
+```{r data wrangle multivariate LSTM}
+##### Data Wrangle the multivariate LSTM
+# Interpolate and take lag of cumulative cases
+new_test <- data %>% 
+  mutate(date = as.Date(date)) %>% 
+  filter(date > as.Date("2020/06/13") & date < as.Date("2021/06/30")) %>% 
+  mutate(cumulative_tested = round(na.approx(cumulative_tested, 
+                                             maxgap = 10, rule = 2), 0)) %>%
+  mutate(new_test = cumulative_tested - lag(cumulative_tested)) %>% 
+  mutate(new_test = replace_na(new_test, 0)) %>% 
+  select(date, new_test, country_name)
+# Replace NAs in new persons vaccinated
+new_vac <- data %>% 
+  mutate(date = as.Date(date)) %>% 
+  filter(date > as.Date("2020/06/13") & date < as.Date("2021/06/30")) %>% 
+  mutate(new_persons_vaccinated = replace_na(new_persons_vaccinated, 0)) %>% 
+  select(date, new_persons_vaccinated, country_name)
+# New deceased
+new_dec <- data %>% 
+  mutate(date = as.Date(date)) %>% 
+  filter(date > as.Date("2020/06/13") & date < as.Date("2021/06/30")) %>% 
+  select(date, new_deceased, country_name)
+# Ensure the data is in the correct format for data array function
+data_test <- data_wrangling_func(new_test %>% rename(cases = new_test), 
+                                 type = "lstm", 
+                                 final_date = "2021/06/16")
+data_vac <- data_wrangling_func(new_vac %>% rename(cases = new_persons_vaccinated),
+                                type = "lstm", 
+                                final_date = "2021/06/16")
+data_dec <- data_wrangling_func(new_dec %>% rename(cases = new_deceased), 
+                                type = "lstm",
+                                final_date = "2021/06/16")
+# Create Data Arrays with 14 blocks of training and target variables
+testing_array <- data_array_func(data_test$data, initial = 14, assess = 14, skip = 14)
+vac_array <- data_array_func(data_vac$data, initial = 14, assess = 14, skip = 14)
+dec_array <- data_array_func(data_dec$data, initial = 14, assess = 14, skip = 14)
+# Combine data arrays of training variables
+new_array <- array(data = c(unlist(data_array$x_train_array[,,1]),
+                            unlist(testing_array$x_train_array[,,1]),
+                            unlist(vac_array$x_train_array[,,1]),
+                            unlist(dec_array$x_train_array[,,1])),
+                   dim = c(nrow(data_array$x_train_array), 14, 4) )
+# Combine data arrays of target variables
+pred_array <- array(data = c(unlist(data_array$x_val_array[,,1]),
+                             unlist(testing_array$x_val_array[,,1]),
+                             unlist(vac_array$x_val_array[,,1]),
+                             unlist(dec_array$x_val_array[,,1])), 
+                    dim = c(nrow(data_array$x_val_array), 14, 4))
+
+```
+
+```{r create Multivariate LSTM Arrays}
+#### Create Levels and Cross Correlations Plots
+test_ccf_plot <- cross_cor_func(data_target = data_lstm, 
+                                data_var = data_test$data, 
+                                title = "New Tests")
+vac_ccf_plot <- cross_cor_func(data_target = data_lstm, 
+                               data_var = data_vac$data, 
+                               title = "New Persons Vaccinated")
+dec_ccf_plot <- cross_cor_func(data_target = data_lstm, 
+                               data_var = data_dec$data, 
+                               title = "New Deceased")
+
+```
+
+```{r ccf-plots, fig.cap = "Levels and cross correlation plots of new tests, new persons vaccinated and new deceased"}
+##### Plot Levels and Cross Correlations
+plot_grid(test_ccf_plot[[1]], test_ccf_plot[[2]], 
+          vac_ccf_plot[[1]], vac_ccf_plot[[2]],
+          dec_ccf_plot[[1]], dec_ccf_plot[[2]], 
+          nrow = 3, ncol = 2)
+
+```
+
+### Hyperparameter Tuning {#Hyperparameter}
+
+For both the univariate and multivariate LSTM models, hyperparameter tuning was used to determine the best models. The hyperparameters that were tuned were number of epochs which was tuned over a range from 50 to 1050, optimizer which was tuned between the adam and SGD optimizers, and the loss function was tuned between MSE and MAE as described in equation \ref{eq2}. This resulted in a hyperparameter grid with 84 rows. The model with the lowest MSE from the predictions of the validation set were selected as the best models. To ensure reproducibility, the tensorflow model's seeds were set to 2021 before each model was fit.
+
+### Google Cloud Compute {#Google}
+
+In order to improve computational speed and allow for more extensive hyperparameter tuning, especially for the multivariate LSTM, a Google Cloud Engine Virtual Machine was used for hyperparameter tuning. Following @grant, a n1-standard-16 virtual machine with 16 vCPUs was spun up in zone europe-west2-a using the code attached in the appendix under Google Cloud Compute. On the machine, R and rstudio were installed, a python virtual environment was created and keras and tensorflow were installed and configured. While, the GPU version of tensorflow was possible to be configured with the correct CUDA drivers, it was unable to be operated through rstudio on the virtual machine. As a result the hyperparameter tuning process took roughly two hours to complete for each of the univariate and multivariate LSTM models.
+
+# Results {#Results}
+
+## ARIMA {#ARIMA}
+
+Following section \@ref(Methodology), three ARIMA orders were identified as possible fits. In order to determine the best fitting model, the three orders are fit to the data and used to predict 14 days worth of cases. The MSE of the predicted and actual cases were compared. Table \@ref(tab:ARIMA-Results) shows that the ARIMA(4,2,4) model had the lowest MSE of 5 223 898. Figure \@ref(fig:ARIMA-plot) shows that the ARIMA(4,2,4) model was able to fit the cyclical nature of the cases but is unable to predict the sharp uptick in cases following the 13th of June. Thus the model is unable to predict the third wave.
+
+```{r ARIMA-Results}
+#### ARIMA Results
+# ARIMA Fit Function for different Orders
+ARIMA_222 <- arima_fit_func(data_arima, c(2,2,2), cases_mean_sd)
+ARIMA_323 <- arima_fit_func(data_arima, c(3,2,3), cases_mean_sd)
+ARIMA_424 <- arima_fit_func(data_arima, c(4,2,4), cases_mean_sd)
+# ARIMA results table
+ARIMA_res <- data.frame("ARIMA_Order" = c("(2,2,2)", "(3,2,3)", "(4,2,4)"),
+           "MSE" = c(ARIMA_222$`Mean Squared Error Arima`,
+                     ARIMA_323$`Mean Squared Error Arima`,
+                     ARIMA_424$`Mean Squared Error Arima`)) %>% 
+  as_tibble() 
+kable(ARIMA_res, digits = 2, row.names = FALSE, 
+      caption = "Results of ARIMA ordering", format = "latex") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+```{r ARIMA-results-plot, fig.cap = "Actual cases and ARIMA(4,2,4) predicted cases"}
+### Plot of ARIMA Results
+ARIMA_424$`ARIMA Plot`
+
+```
+
+## Univariate LSTM {#Univariate_LSTM}
+
+The univariate LSTM models were trained on the univariate training data as described in section \@ref{Methodology}, where the predictors are 14 day blocks of new cases and the target variables are the following 14 days. Hyperparameter tuning was used to determine the best model as in the model with the lowest MSE on the validation set as described in section \@ref{Hyperparameter}. A grid search was conducted, with the hyperparameter grid consisting of 84 combinations of hyperparameters. Tuning was performed on a Google Cloud Compute Virtual Machine as described in section \@ref{Google}. As seen in table \@ref(tab:Hyperparameter-Tune-Uni-LSTM), the best model produced a MSE of 1 008 802 when using MSE loss function, the adam optimizer, and 450 epochs. The best model was closely followed by a model using the MAE loss function, adam optimizer, and 550 epochs. Due to the variability in starting weights, in order to perform exhaustive hyperparameter tuning many different seeds and more combinations of hyperparameters would be necessary. Figure \@ref(fig:best-LSTM-uni-LSTM-plot) shows the 14 day prediction from the validation set of the best univariate LSTM model when compared to the actual cases. The plot shows that the model was able to predict both the cyclical shape of the cases as well as the sudden uptick in cases associated with the thrid wave.
+
+```{r hyperparameter-grid}
+##### Set hyperparameter grid
+hyperparameter_grid <- expand.grid(loss = c("mse", "mae"),
+                                   optimizer = c("adam", "sgd"),
+                                   epochs = seq(50, 1050, 50)) %>%
+  split(., seq(nrow(.)))
+
+```
+
+```{r Hyperparameter-Tune-Uni-LSTM}
+### Hyperparameter tuning for univariate LSTM model
+# If cache == FALSE then perform hyperparameter tuning
+if(cache != TRUE){
+  # Perform hyperparameter tuning
+  hyp_res <- hyp_tune_func(data_train = data_array, 
+                         data_predict = data_array$x_val_array, 
+                         data_actual = data_array$y_val_array[,,1], 
+                         hyperparams = hyperparameter_grid)
+  # Collect results of hyperparameter tuning
+  tuning_res <- hyp_res %>% 
+   do.call("rbind", .)
+  }
+# If cache == TRUE, read in hyperparameter tuning results from 
+# Google Cloud Compute
+if(cache){tuning_res <- read.csv("cache/tuning_res.csv")}
+# Determine best model as model with lowest MSE on validation set
+best_tune <- tuning_res %>%  
+  filter(mse == min(mse))
+# Print Best Univariate LSTM models
+kable(tuning_res %>% arrange(mse) %>% head(), digits = 2, 
+      format = "latex", caption = "Top 5 univariate LSTM models with lowest MSE") %>%
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+```{r best-LSTM-uni-LSTM-plot, fig.cap = "Best performing univariate LSTM model predictions"}
+#### Fit the best univariate LSTM according to the results of 
+# the hyperparameter tuning
+lstm_model <- lstm_fit_func(data_train = data_array,
+                            data_predict = data_array$x_val_array,
+                            epochs = best_tune$epochs, 
+                            optimizer = best_tune$optimizer, 
+                            loss = best_tune$loss)
+# Determine performance
+lstm_performance <- lstm_perform_func(data_train, lstm_model, cases_min_max, 
+                                      title = "Univariate LSTM")
+# Plot predicted and actual cases for validation set
+lstm_performance$`LSTM Plot`
+
+```
+
+## Multivariate LSTM {#Multivariate_LSTM}
+
+The multivariate LSTM models were trained on the multivariate training data as described in section \@ref{Multivariate}, where the predictors are 14 day blocks of new cases, new tests, new persons vaccinated, and new deceased, and the target variables being the 14 day block new cases following the predictor block. Hyperparameter tuning was used to determine the best model as in the model with the lowest MSE on the validation set. A grid search was conducted as described in section \@ref{Hyperparameter}, with the hyperparameter grid consisting of 84 combinations of hyperparameters. Tuning was performed on a Google Cloud Compute Virtual Machine as described in section \@ref{Google}. As seen in table \@ref(tab:Hyperparameter-Tune-Multi-LSTM), the best model produced a MSE of 1 565 288 when using MSE loss function, the adam optimizer, and 550 epochs. This result is substantially worse than the best univariate model. The worse performance of the multivariate LSTM could be due to the increased noise of adding three more variables, the variables not being highly correlated with the target (as seen in the CCF plots), or the model being unable to identify the relationship between the four variables and the target variable. Figure \@ref(fig:best-LSTM-multi-LSTM-plot) shows the 14 day prediction from the validation set of the best multivariate LSTM model when compared to the actual cases. The plot shows that the model was not able to closely match both the cyclical nature of the cases nor the sudden uptick in cases. This explains the higher MSE from the multivariate model when compared to the univariate model.
+
+```{r Hyperparameter-Tune-Multi-LSTM}
+### Hyperparameter tuning for multivariate LSTM model
+# If cache == FALSE then perform hyperparameter tuning
+if(cache != TRUE){
+  # Perform hyperparameter tuning
+  multi_hype_res <- multi_hyp_tune_func(train_array = new_array,
+                                      y_array = data_array$y_train_array,
+                                      pred_array = pred_array, 
+                                      data_actual = data_lstm %>% 
+                                        tail(., n = 14) %>% .$cases,
+                                      hyperparams = hyperparameter_grid)
+  # Collect results of hyperparameter tuning
+  tuning_multi_res <- multi_hype_res %>% 
+     do.call("rbind", .)
+}
+# If cache == TRUE, read in hyperparameter tuning results from 
+# Google Cloud Compute
+if(cache){tuning_multi_res <- read.csv("cache/tuning_multi_res.csv")}
+# Determine best model as model with lowest MSE on validation set
+best_multi <- tuning_multi_res %>% 
+  filter(mse == min(mse))
+# Print Best Multiivariate LSTM models
+kable(tuning_multi_res %>% arrange(mse) %>% head(), digits = 2, 
+      format = "latex", caption = "Top 5 multiivariate LSTM models with lowest MSE") %>% 
+  kable_styling(latex_options = "HOLD_position")
+```
+
+```{r best-LSTM-multi-LSTM-plot, fig.cap = "Best performing multivariate LSTM model predictions"}
+#### Fit the best multivariate LSTM according to the results of 
+# the hyperparameter tuning
+multi_fit <- lstm_multi_fit_func(train_array = new_array,
+                                 y_array = data_array$y_train_array,
+                                 pred_array = pred_array,
+                                 epochs = best_multi$epochs,
+                                 optimizer = best_multi$optimizer,
+                                 loss = best_multi$loss)
+# Determine performance
+lstm_multi_perform <- lstm_perform_func(data_train, lstm_model = multi_fit,
+                                        cases_min_max = cases_min_max, 
+                                        title = "Multivariate LSTM")
+# Plot predicted and actual cases for validation set
+lstm_multi_perform$`LSTM Plot`
+```
+
+## Best Model and Test Set Prediction {#Best}
+
+Table \@ref(tab:best-models) shows that results from the best performing model of each type. The worst performing model was the ARIMA(4,2,4) model with a MSE of 5 223 898. This is expected as the benchmark model and with ARIMA models generally not being suited to model this type of data. The second best model is the multivariate LSTM model with a MSE of 1 565 288. The model performed well and although was able to model the cyclical nature of the cases, it could not model the sudden uptick in the thrid wave. The best performing model is the univariate LSTM with MSE of 1 008 802. The model was able to both model the cyclical nature of cases as well as the sudden uptick in the third wave.
+
+\par
+
+The best model, the univariate LSTM model, was fit to the test data set. The performance is shown in table \@ref(tab:final-fit) with a MSE of 19 025 366 which is substantially greater than the validation set performance. Figure \@ref(fig:test-plot) shows that the model is able to predict the cyclical nature of the case but predicts a much larger uptick in cases towards the end of the 14 day period when compared to the actual cases. Another reason for the poor performance is the magnitude of the predictions and actual cases is far higher with between 7500 and 20 000 cases compared to 2 500 and 13 000 cases.
+
+```{r best-models}
+####### Best Models from each type of model
+# Create tibble of best models
+best_models <- data.frame(Model = c("Univariate LSTM", 
+                                    "Multivariate LSTM",
+                                    "ARIMA(4,2,4)"), 
+                                MSE = c(best_tune$mse, 
+                                        best_multi$mse, 
+                                        ARIMA_424$`Mean Squared Error Arima`)) %>% 
+  as_tibble()
+# Print Best Models
+kable(best_models, format = "latex", digits = 2, 
+      caption = "Table of results from best model of each type of model", 
+      row.names = TRUE) %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+```{r final-fit}
+### Fit best model to final test data and determine performance
+# Wrangle data
+data_final <- data_wrangling_func(data = data %>% rename(cases = new_confirmed), 
+                                  type = "lstm", final_date = "2021/06/30")
+# Save rescaling factors
+cases_min_max_final <- data_final$cases_min_max
+# Set final data
+data_final <- data_final$data
+# Create test data array
+data_final_array <- data_array_func(data_final, initial = 14, assess = 14, skip = 14)
+# Fit best model to test data
+lstm_model_final <- lstm_fit_func(data_train = data_final_array,
+                            data_predict = data_final_array$x_val_array,
+                            epochs = best_tune$epochs, 
+                            optimizer = best_tune$optimizer, 
+                            loss = best_tune$loss)
+# Determine performance
+lstm_performance_final <- lstm_perform_func(data_final, lstm_model_final, 
+                                            cases_min_max = cases_min_max_final, 
+                                            title = "Univariate Model")
+# Print Performance
+kable(data.frame(Model = "Univariate LSTM",
+                 MSE = lstm_performance_final$`Mean Squared Error`), 
+      format = "latex", digits = 2, 
+      caption = "Performance of best model on test data") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+```{r test-plot, fig.cap = "Predictions and cases for test data using best model"}
+#### Plot predictions for test set
+lstm_performance_final$`LSTM Plot` + 
+  labs(subtitle = "Test Set")
+
+```
+
+```{r final-plot, fig.cap = "Test set predictions and actual cases for entire time series"}
+###### Plot entire time series including testing set predictions
+# Wrangle Prediction data
+test_predict_data <- lstm_performance_final$`LSTM Plot`$data %>%
+  filter(name == "predict")
+# Plot prediction and cases for full time series
+data_final %>% 
+  mutate(cases = cases *(cases_min_max_final[2] - cases_min_max_final[1]) 
+         + cases_min_max_final[1]) %>% 
+    mutate(name = "cases") %>% 
+  rename(value = cases) %>% 
+  rbind(., test_predict_data) %>% 
+    ggplot() + 
+    theme_bw() +
+    geom_line(aes(x = date, y = value, color = name), alpha = 0.8) + 
+    labs(title = "SA Covid Cases 13 June 2020 - 30 June 2021",
+         subtitle = "Predicted and Actual Cases", y = "") +
+  scale_color_manual(values = c("deepskyblue4", "red")) +
+  theme(legend.title = element_blank())
+
+```
+
+# Conclusion {#Conclusion}
+
+COVID-19 infections show a pattern of waves and lulls. This pattern results creates difficulties for traditional time-series prediction techniques. This is shown in the poor performance of the ARIMA(4,2,4) model. LSTM models are able to change predictions dependant on the state of the inputs. This allows for the models to differentiate between waves and lulls. This is shown in the improved performance of the LSTM models compared to the ARIMA models. The univariate models produced the best predictions compared to the multivariate models. This could be due to increased noise, low correlation between predictors and target variables, or incorrect architectures or hyperparameters for the multivariate models. The univariate models were able to predict both the cyclical nature of the cases and the increasing trend of the waves. The best univariate model produced a test mse of 19 025 366 which results in roughly 312 cases per day being incorrectly predicted. 
+\par
+
+The impact of lockdowns and other restrictions by the South Africam government were not included in the above models as the impact of them should be included in the cases data. In future, hyperparameter tuning over a larger grid, using Bayesian Optimization or changing the LSTM architectures by adding hidden layers or hidden units could improve results. Furthermore, creating a distribution of predictions based on many different starting weights would be necessary to create more robust predictions. Both of these changes would require many more models being fit which would increase the number of computations. The computational load could be reduced using the GPU version of tensorflow and further Google Cloud Compute Virtual Machines or Docker. 
+
+# Bibliography
+
+<div id="refs"></div>
+
+\newpage
